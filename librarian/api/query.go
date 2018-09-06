@@ -128,11 +128,7 @@ func getSearchResults(sts []string) []docResult {
 }
 
 func QueryHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		w.Write([]byte(`{"code": 405, "msg": "Method Not Allowed."}`))
-		return
-	}
+	common.SignalIfMethodNotAllowed(w, r, "POST")
 
 	decoder := json.NewDecoder(r.Body)
 	defer r.Body.Close()

@@ -55,6 +55,13 @@ type dAllMsg struct {
 	Ch chan []document
 }
 
+type lineProcessData struct {
+	LineIndex int
+	Line      string
+	DocID     string
+	Title     string
+}
+
 // done signals all listening goroutines to stop.
 var done chan bool
 
@@ -123,37 +130,44 @@ func getTokIndexer(tok string) string {
 	return indexerURL + "/index"
 }
 
+func postToLibrarian(tok token) {
+	fmt.Println("adding to librarian:", tok.Token)
+
+	serializedPayload, err := json.Marshal(tok)
+	if err != nil {
+		common.Warn("Unable to serialize the payload. Error:" + err.Error())
+		return
+	}
+
+	indexerURL := getTokIndexer(tok.Token)
+	resp, err := http.Post(indexerURL, "application/json", bytes.NewBuffer(serializedPayload))
+
+	if err != nil {
+		common.Warn("Error while posting to Librarian. Error:" + err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	rawMsg, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		common.Warn("Error while reading response body:" + err.Error())
+		return
+	}
+
+	msg := string(rawMsg)
+	if resp.StatusCode > 200 {
+		common.Warn("Error while posting to Librarian. Msg:" + msg)
+	} else {
+		common.Log("Request was posted to Librairan. Msg:" + msg)
+	}
+}
+
 // indexAdder adds token to index (Librarian).
 func indexAdder(ch chan token, done chan bool) {
 	for {
 		select {
 		case tok := <-ch:
-			fmt.Println("adding to librarian:", tok.Token)
-			serializedPayload, err := json.Marshal(tok)
-			if err != nil {
-				common.Warn("Unable to serialize the payload. Error:" + err.Error())
-			}
-
-			indexerURL := getTokIndexer(tok.Token)
-			resp, err := http.Post(indexerURL, "application/json", bytes.NewBuffer(serializedPayload))
-			if err != nil {
-				common.Warn("Error while posting to Librarian. Error:" + err.Error())
-				continue
-			}
-
-			rawMsg, err := ioutil.ReadAll(resp.Body)
-			defer resp.Body.Close()
-			if err != nil {
-				common.Warn("Error while reading response body:" + err.Error())
-				continue
-			}
-
-			msg := string(rawMsg)
-			if resp.StatusCode > 200 {
-				common.Warn("Error while posting to Librarian. Msg:" + msg)
-			} else {
-				common.Log("Request was posted to Librairan. Msg:" + msg)
-			}
+			postToLibrarian(tok)
 
 		case <-done:
 			common.Log("Exiting indexAdder.")
@@ -185,42 +199,55 @@ func lineStore(ch chan lMeta, callback chan lMsg, done chan bool) {
 	}
 }
 
+func processLine(lineData lineProcessData, lStoreCh chan lMeta, iAddCh chan token) {
+	lStoreCh <- lMeta{
+		LIndex: lineData.LineIndex,
+		Line:   lineData.Line,
+		DocID:  lineData.DocID,
+	}
+
+	index := 0
+	words := strings.Fields(lineData.Line)
+	for _, word := range words {
+		if tok, valid := common.SimplifyToken(word); valid {
+			iAddCh <- token{
+				Token:  tok,
+				LIndex: lineData.LineIndex,
+				Line:   lineData.Line,
+				Index:  index,
+				DocID:  lineData.DocID,
+				Title:  lineData.Title,
+			}
+			index++
+		}
+	}
+}
+
+func processLinesInDoc(doc document, lStoreCh chan lMeta, iAddCh chan token) {
+	docLines := strings.Split(doc.Doc, "\n")
+
+	lin := 0
+	for _, line := range docLines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		lineData := lineProcessData{
+			LineIndex: lin,
+			Line:      line,
+			DocID:     doc.DocID,
+			Title:     doc.Title,
+		}
+		processLine(lineData, lStoreCh, iAddCh)
+		lin++
+	}
+}
+
 // indexProcessor is responsible for converting a document into tokens for indexing.
 func indexProcessor(ch chan document, lStoreCh chan lMeta, iAddCh chan token, done chan bool) {
 	for {
 		select {
 		case doc := <-ch:
-			docLines := strings.Split(doc.Doc, "\n")
-
-			lin := 0
-			for _, line := range docLines {
-				if strings.TrimSpace(line) == "" {
-					continue
-				}
-
-				lStoreCh <- lMeta{
-					LIndex: lin,
-					Line:   line,
-					DocID:  doc.DocID,
-				}
-
-				index := 0
-				words := strings.Fields(line)
-				for _, word := range words {
-					if tok, valid := common.SimplifyToken(word); valid {
-						iAddCh <- token{
-							Token:  tok,
-							LIndex: lin,
-							Line:   line,
-							Index:  index,
-							DocID:  doc.DocID,
-							Title:  doc.Title,
-						}
-						index++
-					}
-				}
-				lin++
-			}
+			processLinesInDoc(doc, lStoreCh, iAddCh)
 
 		case <-done:
 			common.Log("Exiting indexProcessor.")
@@ -252,27 +279,30 @@ func docStore(add chan document, get chan dMsg, dGetAllCh chan dAllMsg, done cha
 	}
 }
 
+func buildNewDocument(newDoc payload) (document, bool) {
+	doc, err := getFile(newDoc.URL)
+	if err != nil {
+		common.Warn(err.Error())
+		return document{}, false
+	}
+
+	return document{
+		Doc:   doc,
+		DocID: getTitleHash(newDoc.Title),
+		URL:   newDoc.URL,
+		Title: newDoc.Title,
+	}, true
+}
+
 // docProcessor processes new document payloads.
 func docProcessor(in chan payload, dStoreCh chan document, dProcessCh chan document, done chan bool) {
 	for {
 		select {
 		case newDoc := <-in:
-			var err error
-			doc := ""
-
-			if doc, err = getFile(newDoc.URL); err != nil {
-				common.Warn(err.Error())
+			msg, ok := buildNewDocument(newDoc)
+			if !ok {
 				continue
 			}
-
-			titleID := getTitleHash(newDoc.Title)
-			msg := document{
-				Doc:   doc,
-				DocID: titleID,
-				URL:   newDoc.URL,
-				Title: newDoc.Title,
-			}
-
 			dStoreCh <- msg
 			dProcessCh <- msg
 		case <-done:
@@ -303,13 +333,11 @@ func getFile(URL string) (string, error) {
 
 	if res, err = http.Get(URL); err != nil {
 		errMsg := fmt.Errorf("Unable to retrieve URL: %s.\nError: %s", URL, err)
-
 		return "", errMsg
-
 	}
+
 	if res.StatusCode > 200 {
 		errMsg := fmt.Errorf("Unable to retrieve URL: %s.\nStatus Code: %d", URL, res.StatusCode)
-
 		return "", errMsg
 	}
 
@@ -317,33 +345,37 @@ func getFile(URL string) (string, error) {
 	defer res.Body.Close()
 
 	if err != nil {
-		errMsg := fmt.Errorf("Error while reading response: URL: %s.\nError: %s", URL, res.StatusCode, err.Error())
-
+		errMsg := fmt.Errorf("Error while reading response: URL: %s.\nStatus Code: %d\nError: %s", URL, res.StatusCode, err.Error())
 		return "", errMsg
 	}
 
 	return string(body), nil
 }
 
+func returnAllDocs(w http.ResponseWriter) {
+	ch := make(chan []document)
+	dGetAllCh <- dAllMsg{Ch: ch}
+	docs := <-ch
+	close(ch)
+
+	serializedPayload, err := json.Marshal(docs)
+	if err == nil {
+		common.Warn("Unable to serialize all docs: " + err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"code": 500, "msg": "Error occurred while trying to retrieve documents."}`))
+	}
+
+	w.Write(serializedPayload)
+}
+
 // FeedHandler start processing the payload which contains the file to index.
 func FeedHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "GET" {
-		ch := make(chan []document)
-		dGetAllCh <- dAllMsg{Ch: ch}
-		docs := <-ch
-		close(ch)
-
-		if serializedPayload, err := json.Marshal(docs); err == nil {
-			w.Write(serializedPayload)
-		} else {
-			common.Warn("Unable to serialize all docs: " + err.Error())
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"code": 500, "msg": "Error occurred while trying to retrieve documents."}`))
-		}
+	if common.SignalIfMethodNotAllowed(w, r, "POST") {
 		return
-	} else if r.Method != "POST" {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		w.Write([]byte(`{"code": 405, "msg": "Method Not Allowed."}`))
+	}
+
+	if r.Method == "GET" {
+		returnAllDocs(w)
 		return
 	}
 

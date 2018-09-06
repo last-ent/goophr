@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+
+	"github.com/last-ent/goophr/librarian/common"
 )
 
 type tPayload struct {
@@ -85,49 +87,66 @@ func StartIndexSystem() {
 	go tIndexer(pProcessCh, tcGet)
 }
 
+func returnDocumentCatalog(msg tcCallback, store tCatalog) {
+	dc := store[msg.Token]
+	msg.Ch <- tcMsg{
+		DC:    dc,
+		Token: msg.Token,
+	}
+}
+
+func getDocumentCatalog(token string, store tCatalog) documentCatalog {
+	dc, exists := store[token]
+	if !exists {
+		dc = documentCatalog{}
+		store[token] = dc
+	}
+	return dc
+}
+
+func getDocumentForDocID(docID string, docCatalog documentCatalog) *document {
+
+	doc, exists := docCatalog[docID]
+	if !exists {
+		doc = &document{
+			DocID:   docID,
+			Indices: map[int]tIndices{},
+		}
+		docCatalog[docID] = doc
+	}
+
+	return doc
+}
+
+func increaseDocumentScore(payload tPayload, store tCatalog) {
+	docCatalog := getDocumentCatalog(payload.Token, store)
+	doc := getDocumentForDocID(payload.DocID, docCatalog)
+	doc.Title = payload.Title
+
+	tin := tIndex{
+		Index:  payload.Index,
+		LIndex: payload.LIndex,
+	}
+	doc.Indices[tin.LIndex] = append(doc.Indices[tin.LIndex], tin)
+	doc.Count++
+}
+
 // tIndexer maintains a catalog of all tokens along with where they occur within documents.
 func tIndexer(ch chan tPayload, callback chan tcCallback) {
 	store := tCatalog{}
 	for {
 		select {
 		case msg := <-callback:
-			dc := store[msg.Token]
-			msg.Ch <- tcMsg{
-				DC:    dc,
-				Token: msg.Token,
-			}
+			returnDocumentCatalog(msg, store)
 
-		case pd := <-ch:
-			dc, exists := store[pd.Token]
-			if !exists {
-				dc = documentCatalog{}
-				store[pd.Token] = dc
-			}
-
-			doc, exists := dc[pd.DocID]
-			if !exists {
-				doc = &document{
-					DocID:   pd.DocID,
-					Title:   pd.Title,
-					Indices: map[int]tIndices{},
-				}
-				dc[pd.DocID] = doc
-			}
-
-			tin := tIndex{
-				Index:  pd.Index,
-				LIndex: pd.LIndex,
-			}
-			doc.Indices[tin.LIndex] = append(doc.Indices[tin.LIndex], tin)
-			doc.Count++
+		case payload := <-ch:
+			increaseDocumentScore(payload, store)
 		}
 	}
 }
 
 func IndexHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		w.Write([]byte(`{"code": 405, "msg": "Method Not Allowed."}`))
+	if common.SignalIfMethodNotAllowed(w, r, "POST") {
 		return
 	}
 

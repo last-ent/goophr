@@ -3,6 +3,7 @@ package common
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"regexp"
 	"strings"
 )
@@ -46,4 +47,14 @@ func SimplifyToken(token string) (string, bool) {
 	}
 
 	return simpleToken, true
+}
+
+// SignalIfMethodNotAllowed check if the method on request is allowed and if not, writes to ResponseWriter
+func SignalIfMethodNotAllowed(w http.ResponseWriter, r *http.Request, method string) (notAllowed bool) {
+	notAllowed = r.Method != method
+	if notAllowed {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"code": 405, "msg": "Method Not Allowed."}`))
+	}
+	return
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -42,6 +43,7 @@ func queryLibrarian(endpoint string, st []byte, ch chan<- queryResult) {
 		ch <- queryResult{}
 		return
 	}
+
 	body, _ := ioutil.ReadAll(resp.Body)
 	defer resp.Body.Close()
 
@@ -72,22 +74,36 @@ func getResultsMap(ch <-chan queryResult) map[string]int {
 	return resultsMap
 }
 
-func QueryHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		w.Write([]byte(`{"code": 405, "msg": "Method Not Allowed."}`))
-		return
-	}
-
-	decoder := json.NewDecoder(r.Body)
-	defer r.Body.Close()
+func decodeSearchTerms(body io.ReadCloser, w http.ResponseWriter) ([]string, error) {
+	decoder := json.NewDecoder(body)
 
 	var searchTerms []string
 	if err := decoder.Decode(&searchTerms); err != nil {
-		common.Warn("Unable to parse request." + err.Error())
-
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"code": 400, "msg": "Unable to parse payload."}`))
+		return nil, err
+	}
+
+	return searchTerms, nil
+}
+
+func launchSearchQueries(st []byte, ch chan<- queryResult) {
+	for _, le := range librarianEndpoints {
+		func(endpoint string) {
+			go queryLibrarian(endpoint, st, ch)
+		}(le)
+	}
+}
+
+func QueryHandler(w http.ResponseWriter, r *http.Request) {
+	if common.SignalIfMethodNotAllowed(w, r, "POST") {
+		return
+	}
+
+	defer r.Body.Close()
+	searchTerms, err := decodeSearchTerms(r.Body, w)
+	if err != nil {
+		common.Warn("Unable to parse request." + err.Error())
 		return
 	}
 
@@ -97,12 +113,7 @@ func QueryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resultsCh := make(chan queryResult)
-
-	for _, le := range librarianEndpoints {
-		func(endpoint string) {
-			go queryLibrarian(endpoint, st, resultsCh)
-		}(le)
-	}
+	launchSearchQueries(st, resultsCh)
 
 	resultsMap := getResultsMap(resultsCh)
 	close(resultsCh)
@@ -116,11 +127,12 @@ func QueryHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Println(fmt.Sprintf("%#v", sortedResults))
 }
 
-func sortResults(rm map[string]int) []document {
+func aggregateResultsScore(resultsMap map[string]int) map[int][]document {
 	scoreMap := map[int][]document{}
 	ch := make(chan document)
+	defer close(ch)
 
-	for docID, score := range rm {
+	for docID, score := range resultsMap {
 		if _, exists := scoreMap[score]; !exists {
 			scoreMap[score] = []document{}
 		}
@@ -134,7 +146,20 @@ func sortResults(rm map[string]int) []document {
 		scoreMap[score] = append(scoreMap[score], doc)
 	}
 
-	close(ch)
+	return scoreMap
+}
+
+func getResultsSortedByScore(scores []int, scoreMap map[int][]document) []document {
+	sortedResults := []document{}
+	for _, score := range scores {
+		resDocs := scoreMap[score]
+		sortedResults = append(sortedResults, resDocs...)
+	}
+	return sortedResults
+}
+
+func sortResults(resultsMap map[string]int) []document {
+	scoreMap := aggregateResultsScore(resultsMap)
 
 	scores := []int{}
 	for score := range scoreMap {
@@ -142,11 +167,5 @@ func sortResults(rm map[string]int) []document {
 	}
 	sort.Sort(sort.Reverse(sort.IntSlice(scores)))
 
-	sortedResults := []document{}
-	for _, score := range scores {
-		resDocs := scoreMap[score]
-		sortedResults = append(sortedResults, resDocs...)
-	}
-
-	return sortedResults
+	return getResultsSortedByScore(scores, scoreMap)
 }
